@@ -1,4 +1,3 @@
-var noVNC = (function () {
 'use strict';
 
 /*
@@ -9309,6 +9308,4 @@ RFB.encodingHandlers = {
     },
 };
 
-return RFB;
-
-}());
+module.exports = RFB;
