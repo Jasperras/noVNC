@@ -21,13 +21,15 @@ export default function Keyboard(target) {
     this._keyDownList = {};         // List of depressed keys
                                     // (even if they are happy)
     this._pendingKey = null;        // Key waiting for keypress
+    this._altGrArmed = false;       // Windows AltGr detection
 
     // keep these here so we can refer to them later
     this._eventHandlers = {
         'keyup': this._handleKeyUp.bind(this),
         'keydown': this._handleKeyDown.bind(this),
         'keypress': this._handleKeyPress.bind(this),
-        'blur': this._allKeysUp.bind(this)
+        'blur': this._allKeysUp.bind(this),
+        'checkalt': this._checkAlt.bind(this),
     };
 };
 
@@ -39,35 +41,19 @@ Keyboard.prototype = {
     // ===== PRIVATE METHODS =====
 
     _sendKeyEvent: function (keysym, code, down) {
+        if (down) {
+            this._keyDownList[code] = keysym;
+        } else {
+            // Do we really think this key is down?
+            if (!(code in this._keyDownList)) {
+                return;
+            }
+            delete this._keyDownList[code];
+        }
+
         Log.Debug("onkeyevent " + (down ? "down" : "up") +
                   ", keysym: " + keysym, ", code: " + code);
-
-        // Windows sends CtrlLeft+AltRight when you press
-        // AltGraph, which tends to confuse the hell out of
-        // remote systems. Fake a release of these keys until
-        // there is a way to detect AltGraph properly.
-        var fakeAltGraph = false;
-        if (down && browser.isWindows()) {
-            if ((code !== 'ControlLeft') &&
-                (code !== 'AltRight') &&
-                ('ControlLeft' in this._keyDownList) &&
-                ('AltRight' in this._keyDownList)) {
-                fakeAltGraph = true;
-                this.onkeyevent(this._keyDownList['AltRight'],
-                                 'AltRight', false);
-                this.onkeyevent(this._keyDownList['ControlLeft'],
-                                 'ControlLeft', false);
-            }
-        }
-
         this.onkeyevent(keysym, code, down);
-
-        if (fakeAltGraph) {
-            this.onkeyevent(this._keyDownList['ControlLeft'],
-                             'ControlLeft', true);
-            this.onkeyevent(this._keyDownList['AltRight'],
-                             'AltRight', true);
-        }
     },
 
     _getKeyCode: function (e) {
@@ -108,6 +94,30 @@ Keyboard.prototype = {
     _handleKeyDown: function (e) {
         var code = this._getKeyCode(e);
         var keysym = KeyboardUtil.getKeysym(e);
+
+        // Windows doesn't have a proper AltGr, but handles it using
+        // fake Ctrl+Alt. However the remote end might not be Windows,
+        // so we need to merge those in to a single AltGr event. We
+        // detect this case by seeing the two key events directly after
+        // each other with a very short time between them (<50ms).
+        if (this._altGrArmed) {
+            this._altGrArmed = false;
+            clearTimeout(this._altGrTimeout);
+
+            if ((code === "AltRight") &&
+                ((e.timeStamp - this._altGrCtrlTime) < 50)) {
+                // FIXME: We fail to detect this if either Ctrl key is
+                //        first manually pressed as Windows then no
+                //        longer sends the fake Ctrl down event. It
+                //        does however happily send real Ctrl events
+                //        even when AltGr is already down. Some
+                //        browsers detect this for us though and set the
+                //        key to "AltGraph".
+                keysym = KeyTable.XK_ISO_Level3_Shift;
+            } else {
+                this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
+            }
+        }
 
         // We cannot handle keys we cannot track, but we also need
         // to deal with virtual keyboards which omit key info
@@ -180,7 +190,14 @@ Keyboard.prototype = {
         this._pendingKey = null;
         stopEvent(e);
 
-        this._keyDownList[code] = keysym;
+        // Possible start of AltGr sequence? (see above)
+        if ((code === "ControlLeft") && browser.isWindows() &&
+            !("ControlLeft" in this._keyDownList)) {
+            this._altGrArmed = true;
+            this._altGrTimeout = setTimeout(this._handleAltGrTimeout.bind(this), 100);
+            this._altGrCtrlTime = e.timeStamp;
+            return;
+        }
 
         this._sendKeyEvent(keysym, code, true);
     },
@@ -209,8 +226,6 @@ Keyboard.prototype = {
             Log.Info('keypress with no keysym:', e);
             return;
         }
-
-        this._keyDownList[code] = keysym;
 
         this._sendKeyEvent(keysym, code, true);
     },
@@ -245,8 +260,6 @@ Keyboard.prototype = {
             keysym = 0;
         }
 
-        this._keyDownList[code] = keysym;
-
         this._sendKeyEvent(keysym, code, true);
     },
 
@@ -255,6 +268,14 @@ Keyboard.prototype = {
 
         var code = this._getKeyCode(e);
 
+        // We can't get a release in the middle of an AltGr sequence, so
+        // abort that detection
+        if (this._altGrArmed) {
+            this._altGrArmed = false;
+            clearTimeout(this._altGrTimeout);
+            this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
+        }
+
         // See comment in _handleKeyDown()
         if (browser.isMac() && (code === 'CapsLock')) {
             this._sendKeyEvent(KeyTable.XK_Caps_Lock, 'CapsLock', true);
@@ -262,14 +283,13 @@ Keyboard.prototype = {
             return;
         }
 
-        // Do we really think this key is down?
-        if (!(code in this._keyDownList)) {
-            return;
-        }
-
         this._sendKeyEvent(this._keyDownList[code], code, false);
+    },
 
-        delete this._keyDownList[code];
+    _handleAltGrTimeout: function () {
+        this._altGrArmed = false;
+        clearTimeout(this._altGrTimeout);
+        this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
     },
 
     _allKeysUp: function () {
@@ -277,8 +297,27 @@ Keyboard.prototype = {
         for (var code in this._keyDownList) {
             this._sendKeyEvent(this._keyDownList[code], code, false);
         };
-        this._keyDownList = {};
         Log.Debug("<< Keyboard.allKeysUp");
+    },
+
+    // Firefox Alt workaround, see below
+    _checkAlt: function (e) {
+        if (e.altKey) {
+            return;
+        }
+
+        let target = this._target;
+        let downList = this._keyDownList;
+        ['AltLeft', 'AltRight'].forEach(function (code) {
+            if (!(code in downList)) {
+                return;
+            }
+
+            let event = new KeyboardEvent('keyup',
+                                          { key: downList[code],
+                                            code: code });
+            target.dispatchEvent(event);
+        });
     },
 
     // ===== PUBLIC METHODS =====
@@ -294,12 +333,35 @@ Keyboard.prototype = {
         // Release (key up) if window loses focus
         window.addEventListener('blur', this._eventHandlers.blur);
 
+        // Firefox has broken handling of Alt, so we need to poll as
+        // best we can for releases (still doesn't prevent the menu
+        // from popping up though as we can't call preventDefault())
+        if (browser.isWindows() && browser.isFirefox()) {
+            let handler = this._eventHandlers.checkalt;
+            ['mousedown', 'mouseup', 'mousemove', 'wheel',
+             'touchstart', 'touchend', 'touchmove',
+             'keydown', 'keyup'].forEach(function (type) {
+                document.addEventListener(type, handler,
+                                          { capture: true,
+                                            passive: true });
+            });
+        }
+
         //Log.Debug("<< Keyboard.grab");
     },
 
     ungrab: function () {
         //Log.Debug(">> Keyboard.ungrab");
         var c = this._target;
+
+        if (browser.isWindows() && browser.isFirefox()) {
+            let handler = this._eventHandlers.checkalt;
+            ['mousedown', 'mouseup', 'mousemove', 'wheel',
+             'touchstart', 'touchend', 'touchmove',
+             'keydown', 'keyup'].forEach(function (type) {
+                document.removeEventListener(type, handler);
+            });
+        }
 
         c.removeEventListener('keydown', this._eventHandlers.keydown);
         c.removeEventListener('keyup', this._eventHandlers.keyup);
